@@ -29,10 +29,15 @@ import json
 import logging
 import sqlite3
 import pathlib
+import time
+import re
 from pathlib import Path
 from datetime import datetime, timedelta
 from urllib.parse import quote
 from typing import Dict, Any, Optional, List, Tuple
+from contextlib import contextmanager
+from functools import wraps, lru_cache
+from collections import defaultdict
 
 from dotenv import load_dotenv
 from telegram import (
@@ -59,15 +64,46 @@ from telegram.error import BadRequest
 # ==============================================================
 # إعدادات البوت
 # ==============================================================
-load_dotenv()
+def load_config() -> Dict[str, Any]:
+    """تحميل الإعدادات والتحقق من الحقول الإجبارية"""
+    load_dotenv()
 
-BOT_TOKEN        = os.getenv("BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
-ADMIN_CHAT_ID    = os.getenv("ADMIN_CHAT_ID", "")
-COMPANY_PHONE    = os.getenv("COMPANY_PHONE",   "+967782611415")
-WHATSAPP_NUMBER  = os.getenv("WHATSAPP_NUMBER", "967782611415")
-COMPANY_EMAIL    = os.getenv("COMPANY_EMAIL",   "info@aljahfali.com")
-COMPANY_WEBSITE  = os.getenv("COMPANY_WEBSITE", "https://aljahfali.com")
-COMPANY_LOCATION = os.getenv("COMPANY_LOCATION","اليمن")
+    bot_token = os.getenv("BOT_TOKEN")
+    if not bot_token or bot_token == "PUT_YOUR_BOT_TOKEN_HERE":
+        raise ValueError(
+            "❌ BOT_TOKEN غير محدد!\n"
+            "يرجى تعيين BOT_TOKEN في ملف .env\n"
+            "مثال: BOT_TOKEN=your_token_here"
+        )
+
+    admin_chat_id = os.getenv("ADMIN_CHAT_ID")
+    if not admin_chat_id:
+        # ننبه فقط لأن تشغيل البوت بدونها ممكن للمستخدم العادي ولكن لن تعمل الإدارة
+        print("⚠️ تحذير: ADMIN_CHAT_ID غير محدد - لوحة الإدارة لن تعمل")
+
+    return {
+        "BOT_TOKEN": bot_token,
+        "ADMIN_CHAT_ID": admin_chat_id or "",
+        "COMPANY_PHONE": os.getenv("COMPANY_PHONE", "+967782611415"),
+        "WHATSAPP_NUMBER": os.getenv("WHATSAPP_NUMBER", "967782611415"),
+        "COMPANY_EMAIL": os.getenv("COMPANY_EMAIL", "info@aljahfali.com"),
+        "COMPANY_WEBSITE": os.getenv("COMPANY_WEBSITE", "https://aljahfali.com"),
+        "COMPANY_LOCATION": os.getenv("COMPANY_LOCATION", "اليمن"),
+    }
+
+try:
+    config = load_config()
+    BOT_TOKEN        = config["BOT_TOKEN"]
+    ADMIN_CHAT_ID    = config["ADMIN_CHAT_ID"]
+    COMPANY_PHONE    = config["COMPANY_PHONE"]
+    WHATSAPP_NUMBER  = config["WHATSAPP_NUMBER"]
+    COMPANY_EMAIL    = config["COMPANY_EMAIL"]
+    COMPANY_WEBSITE  = config["COMPANY_WEBSITE"]
+    COMPANY_LOCATION = config["COMPANY_LOCATION"]
+except ValueError as e:
+    import sys
+    print(str(e))
+    sys.exit(1)
 
 BASE_DIR        = Path(__file__).resolve().parent
 ASSETS_DIR      = BASE_DIR / "assets"
@@ -87,6 +123,224 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger("aljahfali-bot-v3")
+
+# ==============================================================
+# أنظمة المراقبة، الحماية، والتخزين المؤقت
+# ==============================================================
+class RateLimiter:
+    """نظام تحديد معدل الطلبات لحماية البوت من الغمر (Spam)"""
+    def __init__(self, default_limit=3):
+        self.user_last_request = defaultdict(float)
+        self.default_limit = default_limit
+
+    async def check(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+        if not update.effective_user:
+            return True
+
+        user_id = str(update.effective_user.id)
+
+        # الإدارة معفاة من التقييد
+        if ADMIN_CHAT_ID and str(user_id) == str(ADMIN_CHAT_ID):
+            return True
+
+        now = time.time()
+        last_request = self.user_last_request[user_id]
+
+        if now - last_request < self.default_limit:
+            remaining = int(self.default_limit - (now - last_request))
+            try:
+                if update.message:
+                    await update.message.reply_text(
+                        f"⏳ يرجى الانتظار {remaining} ثانية قبل إرسال طلب جديد\n"
+                        f"هذا يضمن جودة الخدمة للجميع 🙏",
+                        parse_mode=ParseMode.HTML
+                    )
+                elif update.callback_query:
+                    await update.callback_query.answer(
+                        f"⏳ يرجى الانتظار {remaining} ثانية...",
+                        show_alert=True
+                    )
+            except Exception:
+                pass
+            return False
+
+        self.user_last_request[user_id] = now
+        return True
+
+rate_limiter = RateLimiter(default_limit=3)
+
+def rate_limited(func):
+    """Decorator لتقييد معدل الطلبات"""
+    @wraps(func)
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE, *args, **kwargs):
+        if not await rate_limiter.check(update, context):
+            return
+        return await func(update, context, *args, **kwargs)
+    return wrapper
+
+
+class InputValidator:
+    """أدوات التحقق من المدخلات وتنظيفها"""
+    @staticmethod
+    def normalize_arabic_numbers(text: str) -> str:
+        """تحويل الأرقام العربية إلى إنجليزية"""
+        arabic_to_english = str.maketrans('٠١٢٣٤٥٦٧٨٩', '0123456789')
+        return text.translate(arabic_to_english)
+
+    @staticmethod
+    def validate_phone(phone: str) -> Tuple[bool, str]:
+        """التحقق من صحة رقم الهاتف"""
+        phone = InputValidator.normalize_arabic_numbers(phone.strip())
+        phone = re.sub(r'[\s\-]', '', phone)
+
+        # أنماط صالحة: يمني دولي، يمني محلي، أو دولي عام
+        patterns = [
+            r'^\+?967[7-9]\d{8}$',  # يمني دولي
+            r'^0?[7-9]\d{8}$',       # يمني محلي
+            r'^\+\d{10,15}$',        # دولي عام
+        ]
+
+        for pattern in patterns:
+            if re.match(pattern, phone):
+                return True, phone
+
+        return False, "رقم الهاتف غير صالح. يرجى إدخال رقم يمني (مثال: 780123456) أو دولي (مثال: +967780123456)"
+
+    @staticmethod
+    def validate_name(name: str) -> Tuple[bool, str]:
+        """التحقق من الاسم"""
+        name = name.strip()
+        if len(name) < 2:
+            return False, "الاسم يجب أن يكون حرفين على الأقل"
+        if len(name) > 100:
+            return False, "الاسم طويل جداً (الحد الأقصى 100 حرف)"
+        if re.search(r'[0-9]', name):
+            return False, "الاسم لا يجب أن يحتوي على أرقام"
+        return True, name
+
+    @staticmethod
+    def sanitize_input(text: str) -> str:
+        """تنظيف المدخلات من الأكواد الخبيثة ووسوم HTML الضارة مع الاحتفاظ بالوسوم المسموحة"""
+        text = re.sub(r'<script.*?</script>', '', text, flags=re.IGNORECASE | re.DOTALL)
+        text = re.sub(r'javascript:', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'on\w+\s*=', '', text, flags=re.IGNORECASE)
+        return text.strip()
+
+
+class PerformanceMonitor:
+    """مراقبة أداء البوت وتسجيل العمليات البطيئة"""
+    def __init__(self):
+        self.metrics = defaultdict(list)
+
+    def record(self, operation: str, duration: float):
+        self.metrics[operation].append(duration)
+
+    def get_stats(self, operation: str) -> dict:
+        times = self.metrics[operation]
+        if not times:
+            return {}
+        return {
+            "count": len(times),
+            "avg": sum(times) / len(times),
+            "min": min(times),
+            "max": max(times),
+            "last": times[-1]
+        }
+
+monitor = PerformanceMonitor()
+
+def monitored(func):
+    """Decorator لمراقبة أداء الدوال وتنبيه العمليات البطيئة (يدعم الدوال المتزامنة وغير المتزامنة)"""
+    import inspect
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            start = time.time()
+            try:
+                result = await func(*args, **kwargs)
+                duration = time.time() - start
+                monitor.record(func.__name__, duration)
+                if duration > 2.0:
+                    logger.warning(f"Slow operation: {func.__name__} took {duration:.2f}s")
+                return result
+            except Exception as e:
+                duration = time.time() - start
+                monitor.record(f"{func.__name__}_error", duration)
+                raise
+        return async_wrapper
+    else:
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            start = time.time()
+            try:
+                result = func(*args, **kwargs)
+                duration = time.time() - start
+                monitor.record(func.__name__, duration)
+                if duration > 2.0:
+                    logger.warning(f"Slow operation: {func.__name__} took {duration:.2f}s")
+                return result
+            except Exception as e:
+                duration = time.time() - start
+                monitor.record(f"{func.__name__}_error", duration)
+                raise
+        return sync_wrapper
+
+
+class BotCache:
+    """نظام تخزين مؤقت للبيانات المتكررة والبطيئة"""
+    def __init__(self, max_size=100):
+        self._cache = {}
+        self._max_size = max_size
+        self._access_times = {}
+
+    def get(self, key: str) -> Any:
+        if key in self._cache:
+            value, expiry = self._cache[key]
+            if time.time() < expiry:
+                self._access_times[key] = time.time()
+                return value
+            else:
+                self.invalidate(key)
+        return None
+
+    def set(self, key: str, value: Any, ttl: int = 300):
+        if len(self._cache) >= self._max_size:
+            # إزالة العنصر الأقدم استخداماً (LRU)
+            oldest = min(self._access_times, key=self._access_times.get)
+            del self._cache[oldest]
+            del self._access_times[oldest]
+
+        self._cache[key] = (value, time.time() + ttl)
+        self._access_times[key] = time.time()
+
+    def invalidate(self, pattern: str = None):
+        if pattern:
+            keys_to_remove = [k for k in self._cache if pattern in k]
+            for k in keys_to_remove:
+                del self._cache[k]
+                if k in self._access_times:
+                    del self._access_times[k]
+        else:
+            self._cache.clear()
+            self._access_times.clear()
+
+cache = BotCache()
+
+
+@contextmanager
+def get_db_connection():
+    """Context manager لإدارة اتصالات قاعدة البيانات وحل مشاكل الخيوط المتعددة"""
+    conn = None
+    try:
+        conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        yield conn
+    except sqlite3.Error as e:
+        logger.error(f"Database connection error: {e}")
+        raise
+    finally:
+        if conn:
+            conn.close()
 
 # ==============================================================
 # حالات نموذج طلب الخدمة
@@ -452,74 +706,73 @@ FORM_STEPS = [
 # ==============================================================
 # قاعدة البيانات
 # ==============================================================
-def init_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(DB_PATH), check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    cur = conn.cursor()
-    cur.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id     TEXT PRIMARY KEY,
-            username        TEXT,
-            first_name      TEXT,
-            last_name       TEXT,
-            phone           TEXT,
-            joined_at       TEXT,
-            last_seen       TEXT,
-            total_requests  INTEGER DEFAULT 0
-        );
+def init_db() -> None:
+    """تهيئة قاعدة البيانات وإنشاء الجداول إذا لم تكن موجودة"""
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.executescript("""
+            CREATE TABLE IF NOT EXISTS users (
+                telegram_id     TEXT PRIMARY KEY,
+                username        TEXT,
+                first_name      TEXT,
+                last_name       TEXT,
+                phone           TEXT,
+                joined_at       TEXT,
+                last_seen       TEXT,
+                total_requests  INTEGER DEFAULT 0
+            );
 
-        CREATE TABLE IF NOT EXISTS service_requests (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            telegram_id     TEXT,
-            username        TEXT,
-            name            TEXT,
-            phone           TEXT,
-            service         TEXT,
-            service_key     TEXT,
-            project_name    TEXT,
-            activity        TEXT,
-            target          TEXT,
-            goal            TEXT,
-            current_status  TEXT,
-            features        TEXT,
-            pages           TEXT,
-            style           TEXT,
-            content         TEXT,
-            references_text TEXT,
-            budget          TEXT,
-            deadline        TEXT,
-            contact_method  TEXT,
-            notes           TEXT,
-            attachments     TEXT DEFAULT '[]',
-            req_status      TEXT DEFAULT 'new',
-            rating          INTEGER DEFAULT 0,
-            rating_comment  TEXT,
-            created_at      TEXT,
-            updated_at      TEXT
-        );
+            CREATE TABLE IF NOT EXISTS service_requests (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_id     TEXT,
+                username        TEXT,
+                name            TEXT,
+                phone           TEXT,
+                service         TEXT,
+                service_key     TEXT,
+                project_name    TEXT,
+                activity        TEXT,
+                target          TEXT,
+                goal            TEXT,
+                current_status  TEXT,
+                features        TEXT,
+                pages           TEXT,
+                style           TEXT,
+                content         TEXT,
+                references_text TEXT,
+                budget          TEXT,
+                deadline        TEXT,
+                contact_method  TEXT,
+                notes           TEXT,
+                attachments     TEXT DEFAULT '[]',
+                req_status      TEXT DEFAULT 'new',
+                rating          INTEGER DEFAULT 0,
+                rating_comment  TEXT,
+                created_at      TEXT,
+                updated_at      TEXT
+            );
 
-        CREATE TABLE IF NOT EXISTS status_history (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id  INTEGER,
-            old_status  TEXT,
-            new_status  TEXT,
-            note        TEXT,
-            changed_at  TEXT,
-            FOREIGN KEY (request_id) REFERENCES service_requests(id)
-        );
+            CREATE TABLE IF NOT EXISTS status_history (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id  INTEGER,
+                old_status  TEXT,
+                new_status  TEXT,
+                note        TEXT,
+                changed_at  TEXT,
+                FOREIGN KEY (request_id) REFERENCES service_requests(id)
+            );
 
-        CREATE TABLE IF NOT EXISTS admin_messages (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            request_id  INTEGER,
-            telegram_id TEXT,
-            message     TEXT,
-            sent_at     TEXT
-        );
-    """)
-    conn.commit()
-    return conn
+            CREATE TABLE IF NOT EXISTS admin_messages (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id  INTEGER,
+                telegram_id TEXT,
+                message     TEXT,
+                sent_at     TEXT
+            );
+        """)
+        conn.commit()
 
-DB_CONN: sqlite3.Connection = init_db()
+init_db()
 
 # ==============================================================
 # أدوات مساعدة
@@ -542,155 +795,216 @@ def progress_bar(step: int, total: int = 17) -> str:
     pct = int((step / total) * 100)
     return f"[{bar}] {pct}%  ({step}/{total})"
 
+@monitored
 def upsert_user(user) -> None:
+    """تحديث بيانات المستخدم مع معالجة أخطاء محددة"""
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("""
-            INSERT INTO users (telegram_id, username, first_name, last_name, joined_at, last_seen)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(telegram_id) DO UPDATE SET
-                username   = excluded.username,
-                first_name = excluded.first_name,
-                last_name  = excluded.last_name,
-                last_seen  = excluded.last_seen
-        """, (
-            str(user.id), user.username or "",
-            user.first_name or "", user.last_name or "",
-            now_text(), now_text(),
-        ))
-        DB_CONN.commit()
-    except Exception:
-        logger.exception("upsert_user failed")
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO users (telegram_id, username, first_name, last_name, joined_at, last_seen)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(telegram_id) DO UPDATE SET
+                    username   = excluded.username,
+                    first_name = excluded.first_name,
+                    last_name  = excluded.last_name,
+                    last_seen  = excluded.last_seen
+            """, (
+                str(user.id), user.username or "",
+                user.first_name or "", user.last_name or "",
+                now_text(), now_text(),
+            ))
+            conn.commit()
+    except sqlite3.IntegrityError as e:
+        logger.error(f"Integrity error upserting user {user.id}: {e}")
+    except sqlite3.OperationalError as e:
+        logger.error(f"Database operational error: {e}")
+    except Exception as e:
+        logger.exception(f"Unexpected error upserting user {user.id}: {e}")
 
+@monitored
 def save_request(data: Dict[str, Any]) -> int:
-    """حفظ طلب الخدمة وإرجاع الـ ID"""
+    """حفظ طلب الخدمة وإرجاع الـ ID وإبطال التخزين المؤقت للإحصائيات"""
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("""
-            INSERT INTO service_requests (
-                telegram_id, username, name, phone, service, service_key,
-                project_name, activity, target, goal, current_status,
-                features, pages, style, content, references_text, budget,
-                deadline, contact_method, notes, attachments,
-                req_status, created_at, updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            data.get("telegram_id"), data.get("username"),
-            data.get("name"), data.get("phone"),
-            data.get("service"), data.get("service_key"),
-            data.get("project_name"), data.get("activity"),
-            data.get("target"), data.get("goal"),
-            data.get("current_status"), data.get("features"),
-            data.get("pages"), data.get("style"),
-            data.get("content"), data.get("references"),
-            data.get("budget"), data.get("deadline"),
-            data.get("contact_method"), data.get("notes"),
-            json.dumps(data.get("attachments", []), ensure_ascii=False),
-            "new", now_text(), now_text(),
-        ))
-        DB_CONN.commit()
-        req_id = cur.lastrowid
-        # تحديث عداد طلبات المستخدم
-        cur.execute("""
-            UPDATE users SET total_requests = total_requests + 1
-            WHERE telegram_id = ?
-        """, (data.get("telegram_id"),))
-        DB_CONN.commit()
-        return req_id
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                INSERT INTO service_requests (
+                    telegram_id, username, name, phone, service, service_key,
+                    project_name, activity, target, goal, current_status,
+                    features, pages, style, content, references_text, budget,
+                    deadline, contact_method, notes, attachments,
+                    req_status, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                data.get("telegram_id"), data.get("username"),
+                data.get("name"), data.get("phone"),
+                data.get("service"), data.get("service_key"),
+                data.get("project_name"), data.get("activity"),
+                data.get("target"), data.get("goal"),
+                data.get("current_status"), data.get("features"),
+                data.get("pages"), data.get("style"),
+                data.get("content"), data.get("references"),
+                data.get("budget"), data.get("deadline"),
+                data.get("contact_method"), data.get("notes"),
+                json.dumps(data.get("attachments", []), ensure_ascii=False),
+                "new", now_text(), now_text(),
+            ))
+            conn.commit()
+            req_id = cur.lastrowid
+            # تحديث عداد طلبات المستخدم
+            cur.execute("""
+                UPDATE users SET total_requests = total_requests + 1
+                WHERE telegram_id = ?
+            """, (data.get("telegram_id"),))
+            conn.commit()
+            
+            # إبطال التخزين المؤقت للإحصائيات
+            cache.invalidate("stats")
+            
+            return req_id
+    except sqlite3.Error as e:
+        logger.error(f"Database error in save_request: {e}")
+        return 0
     except Exception:
-        logger.exception("save_request failed")
+        logger.exception("Unexpected error in save_request")
         return 0
 
+@monitored
 def update_request_status(req_id: int, new_status: str, note: str = "") -> bool:
+    """تحديث حالة الطلب وإبطال التخزين المؤقت للإحصائيات"""
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("SELECT req_status FROM service_requests WHERE id=?", (req_id,))
-        row = cur.fetchone()
-        if not row:
-            return False
-        old_status = row["req_status"]
-        cur.execute("""
-            UPDATE service_requests
-            SET req_status=?, updated_at=?
-            WHERE id=?
-        """, (new_status, now_text(), req_id))
-        cur.execute("""
-            INSERT INTO status_history (request_id, old_status, new_status, note, changed_at)
-            VALUES (?,?,?,?,?)
-        """, (req_id, old_status, new_status, note, now_text()))
-        DB_CONN.commit()
-        return True
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT req_status FROM service_requests WHERE id=?", (req_id,))
+            row = cur.fetchone()
+            if not row:
+                return False
+            old_status = row["req_status"]
+            cur.execute("""
+                UPDATE service_requests
+                SET req_status=?, updated_at=?
+                WHERE id=?
+            """, (new_status, now_text(), req_id))
+            cur.execute("""
+                INSERT INTO status_history (request_id, old_status, new_status, note, changed_at)
+                VALUES (?,?,?,?,?)
+            """, (req_id, old_status, new_status, note, now_text()))
+            conn.commit()
+            
+            # إبطال التخزين المؤقت للإحصائيات
+            cache.invalidate("stats")
+            
+            return True
+    except sqlite3.Error as e:
+        logger.error(f"Database error in update_request_status: {e}")
+        return False
     except Exception:
-        logger.exception("update_request_status failed")
+        logger.exception("Unexpected error in update_request_status")
         return False
 
+@monitored
 def get_request_by_id(req_id: int) -> Optional[Dict]:
+    """جلب تفاصيل الطلب عن طريق المعرف"""
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("SELECT * FROM service_requests WHERE id=?", (req_id,))
-        row = cur.fetchone()
-        return dict(row) if row else None
-    except Exception:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT * FROM service_requests WHERE id=?", (req_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_request_by_id: {e}")
         return None
 
+@monitored
 def get_requests_by_user(telegram_id: str) -> List[Dict]:
+    """جلب طلبات مستخدم معين"""
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("""
-            SELECT id, service, project_name, req_status, created_at
-            FROM service_requests
-            WHERE telegram_id=?
-            ORDER BY id DESC LIMIT 10
-        """, (telegram_id,))
-        return [dict(r) for r in cur.fetchall()]
-    except Exception:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id, service, project_name, req_status, created_at
+                FROM service_requests
+                WHERE telegram_id=?
+                ORDER BY id DESC LIMIT 10
+            """, (telegram_id,))
+            return [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_requests_by_user: {e}")
         return []
 
+@monitored
 def get_stats() -> Dict[str, Any]:
+    """إحصائيات آمنة باستخدام parameterized queries وتخزين مؤقت (Caching)"""
+    cached_stats = cache.get("stats")
+    if cached_stats:
+        return cached_stats
+
     try:
-        cur = DB_CONN.cursor()
-        cur.execute("SELECT COUNT(*) as total FROM service_requests")
-        total = cur.fetchone()["total"]
-        cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status='new'")
-        new_c = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status='in_progress'")
-        in_prog = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status='done'")
-        done_c = cur.fetchone()["c"]
-        cur.execute("SELECT COUNT(*) as c FROM users")
-        users_c = cur.fetchone()["c"]
-        cur.execute("""
-            SELECT service_key, COUNT(*) as c
-            FROM service_requests
-            GROUP BY service_key
-            ORDER BY c DESC LIMIT 3
-        """)
-        top = [(r["service_key"], r["c"]) for r in cur.fetchall()]
-        return {
-            "total": total, "new": new_c, "in_progress": in_prog,
-            "done": done_c, "users": users_c, "top_services": top,
-        }
-    except Exception:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+
+            # إجمالي الطلبات
+            cur.execute("SELECT COUNT(*) as total FROM service_requests")
+            total = cur.fetchone()["total"]
+
+            # الطلبات الجديدة
+            cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status=?", ("new",))
+            new_c = cur.fetchone()["c"]
+
+            # الطلبات قيد التنفيذ
+            cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status=?", ("in_progress",))
+            in_prog = cur.fetchone()["c"]
+
+            # الطلبات المكتملة
+            cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status=?", ("done",))
+            done_c = cur.fetchone()["c"]
+
+            # إجمالي المستخدمين
+            cur.execute("SELECT COUNT(*) as c FROM users")
+            users_c = cur.fetchone()["c"]
+
+            # أكثر الخدمات طلباً
+            cur.execute("""
+                SELECT service_key, COUNT(*) as c
+                FROM service_requests
+                GROUP BY service_key
+                ORDER BY c DESC LIMIT 3
+            """)
+            top = [(r["service_key"], r["c"]) for r in cur.fetchall()]
+
+            stats = {
+                "total": total, "new": new_c, "in_progress": in_prog,
+                "done": done_c, "users": users_c, "top_services": top,
+            }
+            cache.set("stats", stats, ttl=300) # تخزين مؤقت لمدة 5 دقائق
+            return stats
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_stats: {e}")
         return {}
 
+@monitored
 def get_recent_requests(limit: int = 5, offset: int = 0, status_filter: str = None) -> List[Dict]:
+    """جلب أحدث الطلبات مع تصفية الخيارات"""
     try:
-        cur = DB_CONN.cursor()
-        if status_filter:
-            cur.execute("""
-                SELECT id, name, phone, service, req_status, created_at
-                FROM service_requests
-                WHERE req_status=?
-                ORDER BY id DESC LIMIT ? OFFSET ?
-            """, (status_filter, limit, offset))
-        else:
-            cur.execute("""
-                SELECT id, name, phone, service, req_status, created_at
-                FROM service_requests
-                ORDER BY id DESC LIMIT ? OFFSET ?
-            """, (limit, offset))
-        return [dict(r) for r in cur.fetchall()]
-    except Exception:
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            if status_filter:
+                cur.execute("""
+                    SELECT id, name, phone, service, req_status, created_at
+                    FROM service_requests
+                    WHERE req_status=?
+                    ORDER BY id DESC LIMIT ? OFFSET ?
+                """, (status_filter, limit, offset))
+            else:
+                cur.execute("""
+                    SELECT id, name, phone, service, req_status, created_at
+                    FROM service_requests
+                    ORDER BY id DESC LIMIT ? OFFSET ?
+                """, (limit, offset))
+            return [dict(r) for r in cur.fetchall()]
+    except sqlite3.Error as e:
+        logger.error(f"Database error in get_recent_requests: {e}")
         return []
 
 # ==============================================================
@@ -994,6 +1308,7 @@ async def set_bot_commands(application: Application) -> None:
     # ── 1. أوامر المستخدم العادي (المحادثة الخاصة)
     private_commands = [
         BotCommand("start",      "🏠 الصفحة الرئيسية"),
+        BotCommand("actions",    "⚡ الإجراءات السريعة"),
         BotCommand("services",   "🌐 عرض جميع الخدمات"),
         BotCommand("packages",   "📦 الباقات والأسعار"),
         BotCommand("request",    "📩 تقديم طلب خدمة"),
@@ -1010,6 +1325,7 @@ async def set_bot_commands(application: Application) -> None:
     # ── 2. أوامر المجموعات (مختصرة)
     group_commands = [
         BotCommand("start",     "🏠 ابدأ / الرئيسية"),
+        BotCommand("actions",   "⚡ الإجراءات السريعة"),
         BotCommand("services",  "🌐 الخدمات"),
         BotCommand("request",   "📩 طلب خدمة"),
         BotCommand("contact",   "☎️ تواصل معنا"),
@@ -1052,6 +1368,30 @@ async def set_bot_commands(application: Application) -> None:
     except Exception:
         logger.exception("Failed to set bot commands.")
 
+@rate_limited
+async def send_quick_actions(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """إرسال أزرار الإجراءات السريعة للمستخدم"""
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🌐 الخدمات", callback_data="show_services"),
+            InlineKeyboardButton("📦 الباقات", callback_data="show_packages"),
+        ],
+        [
+            InlineKeyboardButton("📩 طلب سريع", callback_data="start_request"),
+            InlineKeyboardButton("❓ أسئلة شائعة", callback_data="show_faq"),
+        ],
+        [
+            InlineKeyboardButton("☎️ تواصل مباشر", url=wa_link()),
+        ],
+    ])
+
+    await update.message.reply_text(
+        "👋 <b>كيف يمكنني مساعدتك اليوم؟ الإجراءات السريعة:</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard
+    )
+
+@rate_limited
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     upsert_user(user)
@@ -1090,6 +1430,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=main_keyboard(),
     )
 
+@rate_limited
 async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     await update.message.reply_text(
@@ -1099,6 +1440,7 @@ async def cmd_services(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=services_keyboard(),
     )
 
+@rate_limited
 async def cmd_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     await update.message.reply_text(
@@ -1108,6 +1450,7 @@ async def cmd_packages(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=packages_keyboard(),
     )
 
+@rate_limited
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     text = (
@@ -1119,6 +1462,7 @@ async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=about_keyboard())
 
+@rate_limited
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     lines = ["🧾 <b>نماذج من أعمالنا ومشاريعنا</b>\n"]
@@ -1129,6 +1473,7 @@ async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=portfolio_keyboard(),
     )
 
+@rate_limited
 async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     await update.message.reply_text(
@@ -1138,6 +1483,7 @@ async def cmd_faq(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=faq_categories_keyboard(),
     )
 
+@rate_limited
 async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     text = (
@@ -1155,6 +1501,7 @@ async def cmd_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=contact_keyboard(),
     )
 
+@rate_limited
 async def cmd_recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     await update.message.reply_text(
@@ -1164,6 +1511,7 @@ async def cmd_recommend(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=recommend_keyboard(),
     )
 
+@rate_limited
 async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     if context.args:
@@ -1204,6 +1552,7 @@ async def cmd_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🌐 عرض كل الخدمات", callback_data="show_services")]]),
         )
 
+@rate_limited
 async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     user_id = str(update.effective_user.id)
@@ -1227,6 +1576,7 @@ async def cmd_mystatus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=my_requests_keyboard(requests),
     )
 
+@rate_limited
 async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update.effective_chat.id):
         await update.message.reply_text("⛔ هذا الأمر مخصص للإدارة فقط.")
@@ -1283,9 +1633,10 @@ async def req_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def req_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
-    if len(val) < 2:
+    ok, msg = InputValidator.validate_name(val)
+    if not ok:
         await update.message.reply_text(
-            "⚠️ الاسم يجب أن يكون حرفين على الأقل. أعد الكتابة:",
+            f"⚠️ {msg}. أعد الكتابة:",
             reply_markup=CANCEL_KB
         )
         return REQ_NAME
@@ -1299,13 +1650,14 @@ async def req_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def req_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
     val = update.message.text.strip()
-    if len(val) < 7:
+    ok, msg = InputValidator.validate_phone(val)
+    if not ok:
         await update.message.reply_text(
-            "⚠️ رقم الهاتف غير صحيح. أعد الكتابة:",
+            f"⚠️ {msg}. أعد الكتابة:",
             reply_markup=CANCEL_KB,
         )
         return REQ_PHONE
-    context.user_data["req"]["phone"] = val
+    context.user_data["req"]["phone"] = msg
     buttons = [[InlineKeyboardButton(v["title"], callback_data=f"rq_svc:{k}")]
                for k, v in SERVICES.items()]
     buttons.append([InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")])
@@ -1695,9 +2047,42 @@ async def req_edit_field_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def req_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     field = context.user_data.get("editing_field")
     if field:
-        context.user_data["req"][field] = update.message.text.strip()
+        val = update.message.text.strip()
+        if field == "name":
+            ok, msg = InputValidator.validate_name(val)
+            if not ok:
+                await update.message.reply_text(
+                    f"⚠️ {msg}. أعد المحاولة:",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 إلغاء التعديل", callback_data="back_to_review")
+                    ]])
+                )
+                return REQ_EDIT_FIELD
+        elif field == "phone":
+            ok, msg = InputValidator.validate_phone(val)
+            if not ok:
+                await update.message.reply_text(
+                    f"⚠️ {msg}. أعد المحاولة:",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("🔙 إلغاء التعديل", callback_data="back_to_review")
+                    ]])
+                )
+                return REQ_EDIT_FIELD
+
+        # تنظيف المدخلات النصية الأخرى
+        val = InputValidator.sanitize_input(val)
+
+        context.user_data["req"][field] = val
+        field_labels = {
+            "name": "الاسم الكامل", "phone": "رقم الهاتف",
+            "project_name": "اسم المشروع", "activity": "نوع النشاط",
+            "target": "الجمهور المستهدف", "goal": "الهدف",
+            "features": "المميزات المطلوبة", "style": "أسلوب التصميم",
+            "budget": "الميزانية", "deadline": "موعد التسليم", "notes": "الملاحظات",
+        }
+        label = field_labels.get(field, field)
         await update.message.reply_text(
-            f"✅ تم تحديث <b>{field}</b> بنجاح.",
+            f"✅ تم تحديث <b>{label}</b> بنجاح.",
             parse_mode=ParseMode.HTML,
         )
     data = context.user_data.get("req", {})
@@ -1770,12 +2155,13 @@ async def admin_reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ]]),
             )
             # حفظ في سجل الرسائل
-            cur = DB_CONN.cursor()
-            cur.execute("""
-                INSERT INTO admin_messages (request_id, telegram_id, message, sent_at)
-                VALUES (?,?,?,?)
-            """, (req_id, tg_id, admin_msg, now_text()))
-            DB_CONN.commit()
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("""
+                    INSERT INTO admin_messages (request_id, telegram_id, message, sent_at)
+                    VALUES (?,?,?,?)
+                """, (req_id, tg_id, admin_msg, now_text()))
+                conn.commit()
             await update.message.reply_text(
                 f"✅ تم إرسال الرسالة بنجاح إلى <b>{name}</b>.",
                 parse_mode=ParseMode.HTML,
@@ -1807,9 +2193,10 @@ async def admin_broadcast_entry(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg_text = update.message.text.strip()
-    cur = DB_CONN.cursor()
-    cur.execute("SELECT telegram_id FROM users")
-    users = [r["telegram_id"] for r in cur.fetchall()]
+    with get_db_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT telegram_id FROM users")
+        users = [r["telegram_id"] for r in cur.fetchall()]
     sent, failed = 0, 0
     broadcast_text = (
         f"📢 <b>إشعار من مؤسسة الجحفلي</b>\n"
@@ -2079,12 +2466,13 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         st = REQUEST_STATUSES.get(req.get("req_status", "new"), ("🆕", "جديد"))
         # سجل الحالات
-        cur = DB_CONN.cursor()
-        cur.execute("""
-            SELECT old_status, new_status, note, changed_at
-            FROM status_history WHERE request_id=? ORDER BY id DESC LIMIT 5
-        """, (req_id,))
-        history = cur.fetchall()
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT old_status, new_status, note, changed_at
+                FROM status_history WHERE request_id=? ORDER BY id DESC LIMIT 5
+            """, (req_id,))
+            history = cur.fetchall()
         hist_text = ""
         if history:
             hist_text = "\n\n🕐 <b>سجل التحديثات:</b>\n"
@@ -2148,9 +2536,10 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         req_id, stars = int(parts[1]), int(parts[2])
         req = get_request_by_id(req_id)
         if req and str(req["telegram_id"]) == str(update.effective_user.id):
-            cur = DB_CONN.cursor()
-            cur.execute("UPDATE service_requests SET rating=? WHERE id=?", (stars, req_id))
-            DB_CONN.commit()
+            with get_db_connection() as conn:
+                cur = conn.cursor()
+                cur.execute("UPDATE service_requests SET rating=? WHERE id=?", (stars, req_id))
+                conn.commit()
             star_text = "⭐" * stars
             await q.message.reply_text(
                 f"🙏 <b>شكرًا على تقييمك!</b>\n\n"
@@ -2236,9 +2625,10 @@ async def handle_admin_callback(q, data: str, context: ContextTypes.DEFAULT_TYPE
     if action == "requests":
         page = int(parts[2]) if len(parts) > 2 else 0
         reqs = get_recent_requests(limit=5, offset=page * 5)
-        cur = DB_CONN.cursor()
-        cur.execute("SELECT COUNT(*) as c FROM service_requests")
-        total = cur.fetchone()["c"]
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(*) as c FROM service_requests")
+            total = cur.fetchone()["c"]
         total_pages = max(1, (total + 4) // 5)
         if not reqs:
             await q.message.reply_text(
@@ -2260,12 +2650,13 @@ async def handle_admin_callback(q, data: str, context: ContextTypes.DEFAULT_TYPE
         status_f = parts[2] if len(parts) > 2 else None
         page = int(parts[3]) if len(parts) > 3 else 0
         reqs = get_recent_requests(limit=5, offset=page * 5, status_filter=status_f)
-        cur = DB_CONN.cursor()
-        if status_f:
-            cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status=?", (status_f,))
-        else:
-            cur.execute("SELECT COUNT(*) as c FROM service_requests")
-        total = cur.fetchone()["c"]
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            if status_f:
+                cur.execute("SELECT COUNT(*) as c FROM service_requests WHERE req_status=?", (status_f,))
+            else:
+                cur.execute("SELECT COUNT(*) as c FROM service_requests")
+            total = cur.fetchone()["c"]
         total_pages = max(1, (total + 4) // 5)
         st_label = status_label(status_f) if status_f else "جميع الطلبات"
         if not reqs:
@@ -2342,12 +2733,13 @@ async def handle_admin_callback(q, data: str, context: ContextTypes.DEFAULT_TYPE
     # سجل الحالات
     if action == "history":
         req_id = int(parts[2]) if len(parts) > 2 else 0
-        cur = DB_CONN.cursor()
-        cur.execute("""
-            SELECT old_status, new_status, note, changed_at
-            FROM status_history WHERE request_id=? ORDER BY id DESC LIMIT 10
-        """, (req_id,))
-        rows = cur.fetchall()
+        with get_db_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT old_status, new_status, note, changed_at
+                FROM status_history WHERE request_id=? ORDER BY id DESC LIMIT 10
+            """, (req_id,))
+            rows = cur.fetchall()
         if not rows:
             await q.message.reply_text(f"📜 لا يوجد سجل لتغييرات الطلب #{req_id}.")
             return
@@ -2492,6 +2884,9 @@ def build_app() -> Application:
         allow_reentry=True,
         per_user=True,
         per_chat=True,
+        conversation_timeout=1800,
+        name="service_request",
+        persistent=False,
     )
 
     # ── ConversationHandler: رد الإدارة
@@ -2506,6 +2901,7 @@ def build_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         allow_reentry=True,
+        conversation_timeout=1800,
     )
 
     # ── ConversationHandler: رسالة جماعية
@@ -2520,6 +2916,7 @@ def build_app() -> Application:
         },
         fallbacks=[CommandHandler("cancel", conv_cancel)],
         allow_reentry=True,
+        conversation_timeout=1800,
     )
 
     # الترتيب مهم: ConversationHandlers أولًا
@@ -2529,6 +2926,7 @@ def build_app() -> Application:
 
     # أوامر عامة
     app.add_handler(CommandHandler("start",      cmd_start))
+    app.add_handler(CommandHandler("actions",    send_quick_actions))
     app.add_handler(CommandHandler("services",   cmd_services))
     app.add_handler(CommandHandler("packages",   cmd_packages))
     app.add_handler(CommandHandler("about",      cmd_about))
