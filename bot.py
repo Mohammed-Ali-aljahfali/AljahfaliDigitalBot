@@ -978,21 +978,79 @@ def requests_list_keyboard(requests: List[Dict], page: int, total_pages: int,
 # أوامر البوت الرئيسية
 # ==============================================================
 async def set_bot_commands(application: Application) -> None:
-    user_commands = [
-        BotCommand("start",      "🏠 ابدأ البوت"),
-        BotCommand("services",   "🌐 الخدمات"),
-        BotCommand("packages",   "📦 الباقات"),
-        BotCommand("request",    "📩 طلب خدمة متقدم"),
+    """
+    ضبط أوامر البوت لكل نطاق (Scope) على حدة:
+      - المستخدمون العاديون  → default + private
+      - المحادثات الجماعية   → group / supergroup
+      - الإدارة (خاص)        → أوامر إضافية
+    """
+    from telegram import (
+        BotCommandScopeDefault,
+        BotCommandScopeAllPrivateChats,
+        BotCommandScopeAllGroupChats,
+        BotCommandScopeChat,
+    )
+
+    # ── 1. أوامر المستخدم العادي (المحادثة الخاصة)
+    private_commands = [
+        BotCommand("start",      "🏠 الصفحة الرئيسية"),
+        BotCommand("services",   "🌐 عرض جميع الخدمات"),
+        BotCommand("packages",   "📦 الباقات والأسعار"),
+        BotCommand("request",    "📩 تقديم طلب خدمة"),
         BotCommand("mystatus",   "📊 متابعة طلباتي"),
-        BotCommand("about",      "ℹ️ عن الجحفلي"),
-        BotCommand("portfolio",  "🧾 أعمالنا"),
+        BotCommand("recommend",  "🔍 ترشيح الخدمة المناسبة"),
+        BotCommand("search",     "🔎 بحث في الخدمات"),
+        BotCommand("portfolio",  "🧾 أعمالنا ومشاريعنا"),
+        BotCommand("about",      "ℹ️ عن مؤسسة الجحفلي"),
         BotCommand("faq",        "❓ الأسئلة الشائعة"),
         BotCommand("contact",    "☎️ تواصل معنا"),
-        BotCommand("recommend",  "🔍 ترشيح الخدمة"),
-        BotCommand("search",     "🔎 البحث في الخدمات"),
         BotCommand("cancel",     "❌ إلغاء العملية الحالية"),
     ]
-    await application.bot.set_my_commands(user_commands)
+
+    # ── 2. أوامر المجموعات (مختصرة)
+    group_commands = [
+        BotCommand("start",     "🏠 ابدأ / الرئيسية"),
+        BotCommand("services",  "🌐 الخدمات"),
+        BotCommand("request",   "📩 طلب خدمة"),
+        BotCommand("contact",   "☎️ تواصل معنا"),
+        BotCommand("faq",       "❓ الأسئلة الشائعة"),
+    ]
+
+    # ── 3. أوامر الإدارة (خاصة بـ ADMIN_CHAT_ID)
+    admin_commands = private_commands + [
+        BotCommand("admin",          "👑 لوحة الإدارة"),
+    ]
+
+    try:
+        # تطبيق على جميع المحادثات (fallback)
+        await application.bot.set_my_commands(
+            private_commands,
+            scope=BotCommandScopeDefault(),
+        )
+        # تطبيق على المحادثات الخاصة
+        await application.bot.set_my_commands(
+            private_commands,
+            scope=BotCommandScopeAllPrivateChats(),
+        )
+        # تطبيق على المجموعات
+        await application.bot.set_my_commands(
+            group_commands,
+            scope=BotCommandScopeAllGroupChats(),
+        )
+        # تطبيق على الإدارة (محادثة خاصة بـ ADMIN)
+        if ADMIN_CHAT_ID:
+            try:
+                await application.bot.set_my_commands(
+                    admin_commands,
+                    scope=BotCommandScopeChat(chat_id=int(ADMIN_CHAT_ID)),
+                )
+            except Exception:
+                logger.warning("Could not set admin-specific commands (chat not started yet).")
+
+        logger.info("Bot commands set successfully for all scopes.")
+
+    except Exception:
+        logger.exception("Failed to set bot commands.")
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -1211,73 +1269,49 @@ async def req_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     upsert_user(update.effective_user)
     context.user_data["req"] = {}
     context.user_data["req_step"] = 1
-    
-    full_name = update.effective_user.full_name or update.effective_user.first_name or "عزيزي"
+    name = update.effective_user.first_name or "عزيزي"
     msg = (
         get_step_header(1, FORM_STEPS[0]) +
-        f"👤 مرحبًا {update.effective_user.first_name or 'عزيزي'}، اكتب <b>اسمك الكامل</b> أو اضغط على الزر أدناه لاستخدام اسم حسابك:"
+        f"👤 مرحبًا {name}، اكتب <b>اسمك الكامل</b>:"
     )
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"👤 استخدام اسمي: {full_name}", callback_data="rq_name:tg")],
-        [InlineKeyboardButton("❌ إلغاء الطلب", callback_data="conv_cancel")]
-    ])
-    
     if update.callback_query:
         await update.callback_query.answer()
-        await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await update.callback_query.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB)
     else:
-        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        await update.message.reply_text(msg, parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB)
     return REQ_NAME
 
 async def req_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.effective_user.full_name or update.effective_user.first_name or "—"
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-        if len(val) < 2:
-            await update.message.reply_text(
-                "⚠️ الاسم يجب أن يكون حرفين على الأقل. أعد الكتابة:",
-                reply_markup=CANCEL_KB
-            )
-            return REQ_NAME
+    val = update.message.text.strip()
+    if len(val) < 2:
+        await update.message.reply_text(
+            "⚠️ الاسم يجب أن يكون حرفين على الأقل. أعد الكتابة:",
+            reply_markup=CANCEL_KB
+        )
+        return REQ_NAME
     context.user_data["req"]["name"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip")],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")]
-    ])
-    await msg_target.reply_text(
+    await update.message.reply_text(
         get_step_header(2, FORM_STEPS[1]) +
-        "📞 اكتب <b>رقم هاتفك</b> أو واتسابك أو اضغط تخطي:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "📞 اكتب <b>رقم هاتفك</b> أو واتسابك:",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_PHONE
 
 async def req_phone(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = "—"
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-        if len(val) < 7:
-            await update.message.reply_text(
-                "⚠️ رقم الهاتف غير صحيح. أعد الكتابة:",
-                reply_markup=CANCEL_KB,
-            )
-            return REQ_PHONE
+    val = update.message.text.strip()
+    if len(val) < 7:
+        await update.message.reply_text(
+            "⚠️ رقم الهاتف غير صحيح. أعد الكتابة:",
+            reply_markup=CANCEL_KB,
+        )
+        return REQ_PHONE
     context.user_data["req"]["phone"] = val
-    
     buttons = [[InlineKeyboardButton(v["title"], callback_data=f"rq_svc:{k}")]
                for k, v in SERVICES.items()]
     buttons.append([InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")])
-    await msg_target.reply_text(
+    await update.message.reply_text(
         get_step_header(3, FORM_STEPS[2]) +
-        "🌐 اختر <b>نوع الخدمة</b> المطلوبة أو اكتبها:",
+        "🌐 اختر <b>نوع الخدمة</b> المطلوبة:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -1290,282 +1324,99 @@ async def req_service_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     svc = SERVICES[key]
     context.user_data["req"]["service"] = svc["title"]
     context.user_data["req"]["service_key"] = key
-    
-    project_suggestions = {
-        "website":   ["متجر إلكتروني", "موقع شركة", "موقع شخصي", "بوابة حجوزات"],
-        "design":    ["هوية بصرية", "تصميم شعار", "مطبوعات", "سوشيال ميديا"],
-        "bot":       ["بوت خدمة عملاء", "بوت طلبات", "بوت مبيعات", "بوت متجر"],
-        "social":    ["إدارة إنستغرام", "إدارة تويتر", "خطة محتوى", "إعلانات"],
-        "seo":       ["تحسين موقعي", "زيادة الزيارات", "بناء روابط", "محتوى SEO"],
-        "video":     ["فيديو ترويجي", "شرح منتج", "محتوى يوتيوب", "موشن جرافيك"],
-        "system":    ["نظام ERP", "نظام حجوزات", "نظام مخازن", "تطبيق جوال"],
-        "ecommerce": ["متجر ملابس", "متجر إلكترونيات", "متجر عطور", "سوبرماركت"],
-    }
-    suggestions = project_suggestions.get(key, ["مشروعي الجديد", "مشروع شركتي"])
-    sug_buttons = [[InlineKeyboardButton(s, callback_data=f"rq_proj:{s}")] for s in suggestions]
-    sug_buttons.append([InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")])
-    
     await q.message.reply_text(
         get_step_header(4, FORM_STEPS[3]) +
         f"✅ اخترت: <b>{svc['title']}</b>\n\n"
         f"💡 <i>تلميح: {svc['ask_hint']}</i>\n\n"
-        "🏷️ اكتب <b>اسم المشروع</b> أو النشاط أو اختر اقتراحًا:",
-        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(sug_buttons),
-    )
-    return REQ_PROJECT_NAME
-
-async def req_service_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data["req"]["service"] = val
-    context.user_data["req"]["service_key"] = "custom"
-    
-    suggestions = ["مشروعي الجديد", "موقع خاص", "تطبيق ذكي", "نظام أتمتة"]
-    sug_buttons = [[InlineKeyboardButton(s, callback_data=f"rq_proj:{s}")] for s in suggestions]
-    sug_buttons.append([InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")])
-    
-    await update.message.reply_text(
-        get_step_header(4, FORM_STEPS[3]) +
-        f"✅ حددت الخدمة: <b>{val}</b>\n\n"
-        "🏷️ اكتب <b>اسم المشروع</b> أو النشاط أو اختر اقتراحًا:",
-        parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(sug_buttons),
+        "🏷️ اكتب <b>اسم المشروع</b> أو النشاط:",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_PROJECT_NAME
 
 async def req_project_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["project_name"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🏢 تجاري", callback_data="rq_act:تجاري"),
-            InlineKeyboardButton("🛠️ خدمي", callback_data="rq_act:خدمي"),
-        ],
-        [
-            InlineKeyboardButton("📚 تعليمي", callback_data="rq_act:تعليمي"),
-            InlineKeyboardButton("🏥 طبي", callback_data="rq_act:طبي"),
-        ],
-        [
-            InlineKeyboardButton("👤 شخصي", callback_data="rq_act:شخصي"),
-            InlineKeyboardButton("💻 تقني", callback_data="rq_act:تقني"),
-        ],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["project_name"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(5, FORM_STEPS[4]) +
-        "🏢 ما <b>نوع النشاط</b>؟ اختر من الأزرار أو اكتبه:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "🏢 ما <b>نوع النشاط</b>؟\n"
+        "<i>مثال: شركة، عيادة، مدرسة، متجر، خدمات تقنية...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_ACTIVITY
 
 async def req_activity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["activity"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("👥 عام", callback_data="rq_tgt:عام"),
-            InlineKeyboardButton("👦 شباب", callback_data="rq_tgt:شباب"),
-        ],
-        [
-            InlineKeyboardButton("💼 أعمال (B2B)", callback_data="rq_tgt:أعمال (B2B)"),
-            InlineKeyboardButton("👩 نساء", callback_data="rq_tgt:نساء"),
-        ],
-        [
-            InlineKeyboardButton("📍 محلي", callback_data="rq_tgt:محلي"),
-            InlineKeyboardButton("🌍 خليجي / دولي", callback_data="rq_tgt:خليجي / دولي"),
-        ],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["activity"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(6, FORM_STEPS[5]) +
-        "🎯 من <b>الجمهور المستهدف</b>؟ اختر من الأزرار أو اكتبه:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "🎯 من <b>الجمهور المستهدف</b>؟\n"
+        "<i>مثال: عملاء محليون، شركات، طلاب، مرضى، زوار Google...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_TARGET
 
 async def req_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["target"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📈 زيادة المبيعات", callback_data="rq_goal:زيادة المبيعات"),
-            InlineKeyboardButton("✨ تعزيز الهوية", callback_data="rq_goal:تعزيز الهوية"),
-        ],
-        [
-            InlineKeyboardButton("🚀 التوسع والانتشار", callback_data="rq_goal:التوسع والانتشار"),
-            InlineKeyboardButton("📢 التعريف بالخدمة", callback_data="rq_goal:التعريف بالخدمة"),
-        ],
-        [
-            InlineKeyboardButton("🛠️ تنظيم العمل والأتمتة", callback_data="rq_goal:تنظيم العمل والأتمتة"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-        ],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["target"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(7, FORM_STEPS[6]) +
-        "🚀 ما <b>الهدف الأساسي</b> من المشروع؟ اختر من الأزرار أو اكتبه:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "🚀 ما <b>الهدف الأساسي</b> من المشروع؟\n"
+        "<i>مثال: جذب عملاء، استقبال طلبات، تنظيم بيانات...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_GOAL
 
 async def req_goal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["goal"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🆕 لا يوجد حالياً (جديد)", callback_data="rq_st:لا يوجد حالياً (جديد)"),
-            InlineKeyboardButton("🔄 يوجد قديم وأريد تطويره", callback_data="rq_st:يوجد قديم وأريد تطويره"),
-        ],
-        [
-            InlineKeyboardButton("💡 فكرة فقط حتى الآن", callback_data="rq_st:فكرة فقط حتى الآن"),
-            InlineKeyboardButton("📐 لدي تصميم / شعار جاهز", callback_data="rq_st:لدي تصميم / شعار جاهز"),
-        ],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["goal"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(8, FORM_STEPS[7]) +
-        "📌 ما <b>وضعك الحالي</b>؟ اختر من الأزرار أو اكتبه:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "📌 ما <b>وضعك الحالي</b>؟\n"
+        "<i>مثال: لدي شعار، موقع قديم، ملفات Excel، فكرة فقط...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_STATUS_FIELD
 
 async def req_status_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["current_status"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("💬 واتساب / تواصل", callback_data="rq_feat:واتساب / تواصل"),
-            InlineKeyboardButton("🔑 لوحة تحكم وإدارة", callback_data="rq_feat:لوحة تحكم وإدارة"),
-        ],
-        [
-            InlineKeyboardButton("💳 نظام دفع إلكتروني", callback_data="rq_feat:نظام دفع إلكتروني"),
-            InlineKeyboardButton("📅 حجز مواعيد", callback_data="rq_feat:حجز مواعيد"),
-        ],
-        [
-            InlineKeyboardButton("📈 تقارير وإحصائيات", callback_data="rq_feat:تقارير وإحصائيات"),
-            InlineKeyboardButton("🌐 متعدد اللغات", callback_data="rq_feat:متعدد اللغات"),
-        ],
-        [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["current_status"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(9, FORM_STEPS[8]) +
-        "🧩 ما <b>المميزات المطلوبة</b>؟ اختر من الأزرار أو اكتبها:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "🧩 ما <b>المميزات المطلوبة</b>؟\n"
+        "<i>مثال: واتساب، نموذج طلب، لوحة تحكم، تقارير، حجز، دفع...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_KB,
     )
     return REQ_FEATURES
 
 async def req_features(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.callback_query:
-        await update.callback_query.answer()
-        val = update.callback_query.data.split(":", 1)[1]
-        msg_target = update.callback_query.message
-    else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["features"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("📄 Landing Page صفحة واحدة", callback_data="rq_pg:صفحة هبوط واحدة"),
-            InlineKeyboardButton("📄 3 صفحات رئيسية", callback_data="rq_pg:3 صفحات رئيسية"),
-        ],
-        [
-            InlineKeyboardButton("📄 5 صفحات متكاملة", callback_data="rq_pg:5 صفحات متكاملة"),
-            InlineKeyboardButton("📄 7+ صفحات متقدمة", callback_data="rq_pg:7 صفحات أو أكثر"),
-        ],
-        [
-            InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-        ],
-    ])
-    await msg_target.reply_text(
+    context.user_data["req"]["features"] = update.message.text.strip()
+    await update.message.reply_text(
         get_step_header(10, FORM_STEPS[9]) +
-        "📄 اختر <b>عدد الصفحات / العناصر المطلوبة</b> أو اكتبها:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "📄 اكتب <b>الصفحات أو العناصر المطلوبة</b>:\n"
+        "<i>للموقع: الرئيسية، من نحن، خدمات، أعمال، تواصل.\n"
+        "للتصميم: المقاس، النصوص، الصور.\n"
+        "للنظام: الشاشات، الجداول، التقارير.</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB,
     )
     return REQ_PAGES
 
 async def req_pages(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
-        data = update.callback_query.data
-        if data == "conv_skip":
-            val = "—"
-        else:
-            val = data.split(":", 1)[1]
-        msg_target = update.callback_query.message
+        context.user_data["req"]["pages"] = "—"
     else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["pages"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("🌟 عصري وجريء", callback_data="rq_style:عصري وجريء"),
-            InlineKeyboardButton("🏛️ كلاسيكي وفخم", callback_data="rq_style:كلاسيكي وفخم"),
-        ],
-        [
-            InlineKeyboardButton("🍃 بسيط ونظيف", callback_data="rq_style:بسيط ونظيف"),
-            InlineKeyboardButton("🎨 ألوان الهوية الخاصة بي", callback_data="rq_style:ألوان الهوية الخاصة بي"),
-        ],
-        [
-            InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-        ],
-    ])
-    await msg_target.reply_text(
+        context.user_data["req"]["pages"] = update.message.text.strip()
+
+    await (update.callback_query.message if update.callback_query else update.message).reply_text(
         get_step_header(11, FORM_STEPS[10]) +
-        "🎨 ما <b>أسلوب التصميم المفضل</b>؟ اختر من الأزرار أو اكتبه:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "🎨 ما <b>أسلوب التصميم المفضل</b>؟\n"
+        "<i>مثال: داكن نيون، رسمي، فاخر، بسيط، تقني، ذهبي، طبي...</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB,
     )
     return REQ_STYLE
 
 async def req_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
-        data = update.callback_query.data
-        if data == "conv_skip":
-            val = "—"
-        else:
-            val = data.split(":", 1)[1]
-        msg_target = update.callback_query.message
+        context.user_data["req"]["style"] = "—"
     else:
-        val = update.message.text.strip()
-        msg_target = update.message
-    context.user_data["req"]["style"] = val
-    
+        context.user_data["req"]["style"] = update.message.text.strip()
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("✅ لدي الشعار والمحتوى",     callback_data="content:ready")],
         [InlineKeyboardButton("🖼️ لدي الشعار فقط",          callback_data="content:logo")],
@@ -1573,9 +1424,10 @@ async def req_style(update: Update, context: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton("❓ أحتاج تجهيز كل شيء",     callback_data="content:none")],
         [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
     ])
+    msg_target = update.callback_query.message if update.callback_query else update.message
     await msg_target.reply_text(
         get_step_header(12, FORM_STEPS[11]) +
-        "🗂️ هل <b>المحتوى والشعار جاهزان</b>؟ اختر من الأزرار أو اكتب الوضع:",
+        "🗂️ هل <b>المحتوى والشعار جاهزان</b>؟",
         parse_mode=ParseMode.HTML, reply_markup=keyboard,
     )
     return REQ_CONTENT
@@ -1590,56 +1442,22 @@ async def req_content_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "none":  "❓ أحتاج تجهيز كل شيء.",
     }
     key = q.data.split(":", 1)[1]
-    context.user_data["req"]["content"] = mapping.get(key, key)
-    
+    context.user_data["req"]["content"] = mapping.get(key, "—")
     await q.message.reply_text(
         get_step_header(13, FORM_STEPS[12]) +
         "🔗 هل لديك <b>أمثلة أو روابط أو تصاميم تعجبك</b>؟\n"
-        "أرسل رابطًا أو صورة أو اختر من الأزرار:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🙅‍♂️ لا يوجد حالياً", callback_data="rq_ref:لا يوجد")],
-            [InlineKeyboardButton("📐 حسب رؤية المصمم", callback_data="rq_ref:حسب رؤية المصمم")],
-            [
-                InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-            ],
-        ])
-    )
-    return REQ_REFERENCES
-
-async def req_content_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data["req"]["content"] = val
-    
-    await update.message.reply_text(
-        get_step_header(13, FORM_STEPS[12]) +
-        "🔗 هل لديك <b>أمثلة أو روابط أو تصاميم تعجبك</b>؟\n"
-        "أرسل رابطًا أو صورة أو اختر من الأزرار:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🙅‍♂️ لا يوجد حالياً", callback_data="rq_ref:لا يوجد")],
-            [InlineKeyboardButton("📐 حسب رؤية المصمم", callback_data="rq_ref:حسب رؤية المصمم")],
-            [
-                InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-            ],
-        ])
+        "<i>أرسل رابطًا أو صورة أو اكتب: لا يوجد</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB,
     )
     return REQ_REFERENCES
 
 async def req_references(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["req"].setdefault("attachments", [])
     msg = update.message
-    
+
     if update.callback_query:
         await update.callback_query.answer()
-        data = update.callback_query.data
-        if data == "conv_skip":
-            val = "—"
-        else:
-            val = data.split(":", 1)[1]
-        context.user_data["req"]["references"] = val
+        context.user_data["req"]["references"] = "—"
         msg_target = update.callback_query.message
     elif msg and (msg.photo or msg.document):
         try:
@@ -1654,25 +1472,17 @@ async def req_references(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 fname = f"attach_{now_text().replace(' ','_').replace(':','-')}_{orig}"
                 await f.download_to_drive(str(ATTACHMENTS_DIR / fname))
                 context.user_data["req"]["attachments"].append(fname)
-            
-            keyboard = InlineKeyboardMarkup([
-                [InlineKeyboardButton("✅ إكمال", callback_data="rq_ref:تم إرسال المرفقات")],
-                [InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel")],
-            ])
-            await msg.reply_text("✅ تم حفظ المرفق. أرسل المزيد أو اضغط على إكمال:",
-                                  parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await msg.reply_text("✅ تم حفظ المرفق. أضف المزيد أو أكمل بكتابة: <b>تم</b>",
+                                  parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB)
             return REQ_REFERENCES
         except Exception:
             logger.exception("attachment download failed")
             await msg.reply_text("⚠️ فشل حفظ المرفق. أعد الإرسال أو اكتب: لا يوجد")
             return REQ_REFERENCES
     else:
-        val = msg.text.strip()
-        if val.lower() == "تم":
-            val = "تم إرسال المرفقات"
-        context.user_data["req"]["references"] = val
+        context.user_data["req"]["references"] = msg.text.strip()
         msg_target = msg
-        
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💸 ميزانية محدودة",            callback_data="budget:low")],
         [InlineKeyboardButton("💰 ميزانية متوسطة",           callback_data="budget:mid")],
@@ -1682,7 +1492,7 @@ async def req_references(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await msg_target.reply_text(
         get_step_header(14, FORM_STEPS[13]) +
-        "💰 اختر <b>الميزانية التقريبية</b> أو اكتب ميزانيتك المحددة:",
+        "💰 اختر <b>الميزانية التقريبية</b>:",
         parse_mode=ParseMode.HTML, reply_markup=keyboard,
     )
     return REQ_BUDGET
@@ -1697,68 +1507,24 @@ async def req_budget_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "quote": "📊 عرض سعر بعد الدراسة",
     }
     key = q.data.split(":", 1)[1]
-    context.user_data["req"]["budget"] = mapping.get(key, key)
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏱️ خلال أسبوع", callback_data="rq_dl:خلال أسبوع"),
-            InlineKeyboardButton("⏱️ خلال أسبوعين", callback_data="rq_dl:خلال أسبوعين"),
-        ],
-        [
-            InlineKeyboardButton("📅 خلال شهر", callback_data="rq_dl:خلال شهر"),
-            InlineKeyboardButton("🤷‍♂️ غير مستعجل", callback_data="rq_dl:غير مستعجل"),
-        ],
-        [
-            InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-        ],
-    ])
+    context.user_data["req"]["budget"] = mapping.get(key, "—")
     await q.message.reply_text(
         get_step_header(15, FORM_STEPS[14]) +
-        "⏱️ متى تريد <b>التسليم</b>؟ اختر من الأزرار أو اكتب التاريخ/المدة:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
-    )
-    return REQ_DEADLINE
-
-async def req_budget_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data["req"]["budget"] = val
-    
-    keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏱️ خلال أسبوع", callback_data="rq_dl:خلال أسبوع"),
-            InlineKeyboardButton("⏱️ خلال أسبوعين", callback_data="rq_dl:خلال أسبوعين"),
-        ],
-        [
-            InlineKeyboardButton("📅 خلال شهر", callback_data="rq_dl:خلال شهر"),
-            InlineKeyboardButton("🤷‍♂️ غير مستعجل", callback_data="rq_dl:غير مستعجل"),
-        ],
-        [
-            InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-            InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-        ],
-    ])
-    await update.message.reply_text(
-        get_step_header(15, FORM_STEPS[14]) +
-        "⏱️ متى تريد <b>التسليم</b>؟ اختر من الأزرار أو اكتب التاريخ/المدة:",
-        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+        "⏱️ متى تريد <b>التسليم</b>؟\n"
+        "<i>مثال: خلال أسبوع، شهر، غير مستعجل، حسب الاتفاق</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB,
     )
     return REQ_DEADLINE
 
 async def req_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
-        data = update.callback_query.data
-        if data == "conv_skip":
-            val = "حسب الاتفاق"
-        else:
-            val = data.split(":", 1)[1]
+        context.user_data["req"]["deadline"] = "حسب الاتفاق"
         msg_target = update.callback_query.message
     else:
-        val = update.message.text.strip()
+        context.user_data["req"]["deadline"] = update.message.text.strip()
         msg_target = update.message
-    context.user_data["req"]["deadline"] = val
-    
+
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("💬 واتساب",      callback_data="contact_m:whatsapp")],
         [InlineKeyboardButton("✈️ تليجرام",    callback_data="contact_m:telegram")],
@@ -1767,7 +1533,7 @@ async def req_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ])
     await msg_target.reply_text(
         get_step_header(16, FORM_STEPS[15]) +
-        "💬 ما <b>طريقة التواصل المفضلة</b>؟ اختر زر أو اكتب الطريقة:",
+        "💬 ما <b>طريقة التواصل المفضلة</b>؟",
         parse_mode=ParseMode.HTML, reply_markup=keyboard,
     )
     return REQ_CONTACT
@@ -1781,55 +1547,36 @@ async def req_contact_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "call":     "📞 اتصال هاتفي",
     }
     key = q.data.split(":", 1)[1]
-    context.user_data["req"]["contact_method"] = mapping.get(key, key)
-    
+    context.user_data["req"]["contact_method"] = mapping.get(key, "—")
     await q.message.reply_text(
         get_step_header(17, FORM_STEPS[16]) +
         "📝 هل لديك <b>ملاحظات إضافية</b>؟\n"
-        "اختر زر أو اكتب ملاحظاتك:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🙅‍♂️ لا يوجد", callback_data="rq_notes:لا يوجد")],
-            [
-                InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-            ],
-        ])
-    )
-    return REQ_NOTES
-
-async def req_contact_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    val = update.message.text.strip()
-    context.user_data["req"]["contact_method"] = val
-    
-    await update.message.reply_text(
-        get_step_header(17, FORM_STEPS[16]) +
-        "📝 هل لديك <b>ملاحظات إضافية</b>؟\n"
-        "اختر زر أو اكتب ملاحظاتك:",
-        parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🙅‍♂️ لا يوجد", callback_data="rq_notes:لا يوجد")],
-            [
-                InlineKeyboardButton("⏭️ تخطي", callback_data="conv_skip"),
-                InlineKeyboardButton("❌ إلغاء", callback_data="conv_cancel"),
-            ],
-        ])
+        "<i>أو اكتب: لا يوجد</i>",
+        parse_mode=ParseMode.HTML, reply_markup=CANCEL_SKIP_KB,
     )
     return REQ_NOTES
 
 async def req_notes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.callback_query:
         await update.callback_query.answer()
-        data = update.callback_query.data
-        if data == "conv_skip":
-            val = "—"
-        else:
-            val = data.split(":", 1)[1]
+        context.user_data["req"]["notes"] = "—"
         msg_target = update.callback_query.message
     else:
-        val = update.message.text.strip()
+        context.user_data["req"]["notes"] = update.message.text.strip()
         msg_target = update.message
-    context.user_data["req"]["notes"] = val
+
+    data = context.user_data["req"]
+    summary = format_request_summary(data)
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تأكيد وإرسال الطلب", callback_data="confirm_req")],
+        [InlineKeyboardButton("✏️ تعديل الطلب",        callback_data="edit_req")],
+        [InlineKeyboardButton("❌ إلغاء الطلب",        callback_data="conv_cancel")],
+    ])
+    await msg_target.reply_text(
+        "📋 <b>مراجعة الطلب قبل الإرسال</b>\n\n" + summary,
+        parse_mode=ParseMode.HTML, reply_markup=keyboard,
+    )
+    return REQ_CONFIRM
 
 async def req_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -2694,76 +2441,40 @@ def build_app() -> Application:
             CallbackQueryHandler(req_entry, pattern="^start_request$"),
             MessageHandler(filters.Regex("^📩 طلب خدمة$") & ~filters.COMMAND, req_entry),
         ],
-                states={
-            REQ_NAME: [
-                CallbackQueryHandler(req_name, pattern="^rq_name:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_name),
-            ],
-            REQ_PHONE: [
-                CallbackQueryHandler(req_phone, pattern="^(rq_phone:|conv_skip)$"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_phone),
-            ],
-            REQ_SERVICE: [
-                CallbackQueryHandler(req_service_cb, pattern="^rq_svc:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_service_text),
-            ],
-            REQ_PROJECT_NAME: [
-                CallbackQueryHandler(req_project_name, pattern="^rq_proj:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_project_name),
-            ],
-            REQ_ACTIVITY: [
-                CallbackQueryHandler(req_activity, pattern="^rq_act:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_activity),
-            ],
-            REQ_TARGET: [
-                CallbackQueryHandler(req_target, pattern="^rq_tgt:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_target),
-            ],
-            REQ_GOAL: [
-                CallbackQueryHandler(req_goal, pattern="^rq_goal:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_goal),
-            ],
-            REQ_STATUS_FIELD: [
-                CallbackQueryHandler(req_status_field, pattern="^rq_st:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_status_field),
-            ],
-            REQ_FEATURES: [
-                CallbackQueryHandler(req_features, pattern="^rq_feat:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_features),
-            ],
+        states={
+            REQ_NAME:         [MessageHandler(filters.TEXT & ~filters.COMMAND, req_name)],
+            REQ_PHONE:        [MessageHandler(filters.TEXT & ~filters.COMMAND, req_phone)],
+            REQ_SERVICE:      [CallbackQueryHandler(req_service_cb, pattern="^rq_svc:")],
+            REQ_PROJECT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_project_name)],
+            REQ_ACTIVITY:     [MessageHandler(filters.TEXT & ~filters.COMMAND, req_activity)],
+            REQ_TARGET:       [MessageHandler(filters.TEXT & ~filters.COMMAND, req_target)],
+            REQ_GOAL:         [MessageHandler(filters.TEXT & ~filters.COMMAND, req_goal)],
+            REQ_STATUS_FIELD: [MessageHandler(filters.TEXT & ~filters.COMMAND, req_status_field)],
+            REQ_FEATURES:     [MessageHandler(filters.TEXT & ~filters.COMMAND, req_features)],
             REQ_PAGES: [
-                CallbackQueryHandler(req_pages, pattern="^(rq_pg:|conv_skip)$"),
+                CallbackQueryHandler(req_pages, pattern="^conv_skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, req_pages),
             ],
             REQ_STYLE: [
-                CallbackQueryHandler(req_style, pattern="^(rq_style:|conv_skip)$"),
+                CallbackQueryHandler(req_style, pattern="^conv_skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, req_style),
             ],
-            REQ_CONTENT: [
-                CallbackQueryHandler(req_content_cb, pattern="^content:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_content_text),
-            ],
+            REQ_CONTENT:    [CallbackQueryHandler(req_content_cb, pattern="^content:")],
             REQ_REFERENCES: [
-                CallbackQueryHandler(req_references, pattern="^(rq_ref:|conv_skip)$"),
+                CallbackQueryHandler(req_references, pattern="^conv_skip$"),
                 MessageHandler(
                     (filters.TEXT | filters.PHOTO | filters.Document.ALL) & ~filters.COMMAND,
                     req_references
                 ),
             ],
-            REQ_BUDGET: [
-                CallbackQueryHandler(req_budget_cb, pattern="^budget:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_budget_text),
-            ],
+            REQ_BUDGET:   [CallbackQueryHandler(req_budget_cb, pattern="^budget:")],
             REQ_DEADLINE: [
-                CallbackQueryHandler(req_deadline, pattern="^(rq_dl:|conv_skip)$"),
+                CallbackQueryHandler(req_deadline, pattern="^conv_skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, req_deadline),
             ],
-            REQ_CONTACT: [
-                CallbackQueryHandler(req_contact_cb, pattern="^contact_m:"),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, req_contact_text),
-            ],
+            REQ_CONTACT: [CallbackQueryHandler(req_contact_cb, pattern="^contact_m:")],
             REQ_NOTES: [
-                CallbackQueryHandler(req_notes, pattern="^(rq_notes:|conv_skip)$"),
+                CallbackQueryHandler(req_notes, pattern="^conv_skip$"),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, req_notes),
             ],
             REQ_CONFIRM: [
