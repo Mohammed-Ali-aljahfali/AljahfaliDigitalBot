@@ -48,3 +48,19 @@ python bot.py
 /contact
 /recommend
 /admin_requests
+
+## نشر على Railway
+1. أنشئ مشروعًا جديدًا في Railway.
+2. اربط المستودع ب Railway أو قم برفع الملفات من هذا المشروع.
+3. اضف متغيرات البيئة التالية في إعدادات المشروع:
+   - `BOT_TOKEN`
+   - `ADMIN_CHAT_ID`
+   - `COMPANY_PHONE`
+   - `WHATSAPP_NUMBER`
+   - `COMPANY_EMAIL`
+   - `COMPANY_WEBSITE`
+   - `COMPANY_LOCATION`
+4. Railway سيستخدم `Procfile` الموجود في المشروع لتشغيل البوت تلقائيًا.
+5. شغّل المشروع وانتظر بدء الخدمة.
+
+> ملاحظة: لا تحتاج إلى ملف `.env` على Railway، فقط اضبط المتغيرات في إعدادات البيئة الخاصة بالمشروع.
