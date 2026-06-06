@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+env/
+venv/
+ENV/
+env.bak/
+
+# VSCode
+.vscode/
+
+# Mac
+.DS_Store
+
+# Env files
+.env
+
+# Data and DB
+/data/service_requests.db
+/data/attachments/
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# Logs
+*.log
+
+# Editor backups
+*~
+.~*
+
+# Pipenv
+.Pipfile.lock
+
+# PyInstaller
+#  Usually these files are written by a python script from a template
+dist/
+build/
